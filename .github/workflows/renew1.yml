@@ -1,4 +1,4 @@
-name: HidenCloud Auto Renew New
+name: HidenCloud Auto Renew
 
 on:
   schedule:
