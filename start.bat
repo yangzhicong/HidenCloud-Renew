@@ -8,6 +8,7 @@ echo.
 echo 正在启动脚本...
 echo.
 
+node win_login.js
 node local_renew.js
 
 echo.
