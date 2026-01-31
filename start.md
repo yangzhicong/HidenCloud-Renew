@@ -15,38 +15,61 @@
 
 ## 💻 本地方案：3 步即可开始使用
 
-### 步骤 1️⃣：获取 Cookie
+### 步骤 1️⃣：准备 Cookie (二选一)
 
-1. 打开浏览器，访问 https://dash.hidencloud.com
-2. 登录你的账号
-3. 按 `F12` 打开开发者工具
-4. 切换到 `Network (网络)` 标签
-5. 刷新页面 (F5)
-6. 点击任意请求，找到 `Request Headers` 中的 `Cookie` 字段
-7. 复制完整的 Cookie 内容
+#### 方案 A：Windows 自动获取（推荐）
 
-### 步骤 2️⃣：配置 Cookie
+适用于 Windows 本地用户，无需手动抓包。
 
-在项目目录下编辑 `cookie.json` 文件：
+1. 在项目目录新建 `users.json` 文件：
+   ```json
+   [
+     {"username": "你的邮箱", "password": "你的密码"},
+     {"username": "如有第二个账号", "password": "密码"}
+   ]
+   ```
+2. 打开终端运行：
+   ```bash
+   node win_login.js
+   ```
+3. 等待浏览器自动登录完成，脚本会自动生成 `cookie.json`。
 
-```json
-{
-    "cookie1": "粘贴你复制的Cookie这里",
-    "cookie2": ""
-}
-```
+#### 方案 B：手动获取
 
-- `cookie1` 填入第一个账号的 Cookie
-- `cookie2` 填入第二个账号的 Cookie（如果有）
-- 如果没有第二个账号，留空即可
+1. 浏览器访问 [HidenCloud](https://dash.hidencloud.com) 并登录。
+2. 按 `F12` -> `Network` -> 刷新页面 -> 点击请求 -> 复制 `Cookie` 值。
+3. 在项目目录新建 `cookie.json` 文件：
+   ```json
+   {
+       "cookie1": "粘贴你复制的Cookie这里",
+       "cookie2": ""
+   }
+   ```
+
+### 步骤 2️⃣：配置 Chrome 路径（仅方案 A 需要）
+
+使用 **方案 A** 时，请确保 `win_login.js` 中的 Chrome 浏览器路径与你的本机路径一致。
+
+1. 打开 `win_login.js` 文件。
+2. 找到代码：
+   ```javascript
+   const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+   ```
+3. 检查你的电脑中 `chrome.exe` 的安装位置。如果不同，请**手动替换**路径字符串。
 
 ### 步骤 3️⃣：运行脚本
 
-#### 方法一：双击批处理文件（Windows）
+#### 方法一：一键自动登录 
 
-直接双击 `start.bat` 文件
+双击 **`start.bat`** 文件。
+脚本会自动执行以下流程：
 
-#### 方法二：使用命令行
+1. 运行 `win_login.js` 自动打开本地 Chrome 获取 Cookie。
+2. 成功后，自动运行 `local_renew.js` 进行续期。
+
+#### 方法二：分步运行
+
+如果你只想单独运行续期（假设已有 `cookie.json`）：
 
 ```bash
 npm start
