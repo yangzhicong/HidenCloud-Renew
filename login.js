@@ -289,5 +289,16 @@ async function handleVerification(page) {
         }
     }
 
-    await browser.close();
+    // Force cleanup
+    console.log('Cleaning up...');
+    try { if (browser) await browser.close(); } catch (e) { }
+
+    // Kill the chrome process we blindly spawned if we can find it, 
+    // or just rely on process.exit() to clean up this node process.
+    // Since chrome was spawned detached, we should try to kill it if we kept a reference, 
+    // but launchChrome didn't return it.
+    // For now, process.exit(0) is the most important fix.
+
+    console.log('Done (Forced Exit).');
+    process.exit(0);
 })();
