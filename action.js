@@ -436,43 +436,73 @@ async function handleVerification(page) {
         process.exit(1);
     }
 
-    console.log(`🚀 Starting Action Script for ${users.length} users...`);
+    console.log(`🚀 Starting Action Script for ${users.length} users (Isolated Environments)...`);
     const summary = [];
-
-    // Launch Chrome Process (Detached)
-    try {
-        await launchChrome();
-    } catch (e) {
-        console.error('Fatal: Could not launch Chrome.', e);
-        process.exit(1);
-    }
-
-    console.log(`Connecting to Chrome at port ${DEBUG_PORT}...`);
-    let browser;
-    try {
-        browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
-    } catch (e) {
-        console.error('Fatal: Could not connect to Chrome CDP.', e);
-        process.exit(1);
-    }
-
-    // Reuse the wrapper context
-    const defaultContext = browser.contexts()[0];
 
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
         console.log(`\n=== Processing User ${i + 1}: ${user.username} ===`);
 
-        // Use the existing context but ensure it's clean-ish or just new Page
-        const page = await defaultContext.newPage();
-        await page.addInitScript(INJECTED_SCRIPT);
-        page.setDefaultTimeout(60000);
-
-        let cookieStr = '';
-        let loginSuccess = false;
-        let userAgent = '';
+        // 1. Prepare Isolated Environment
+        let browser;
+        let chromeProcess;
+        let page;
 
         try {
+            // Launch specific Chrome for this user
+            // We use the launchChrome logic but inlined or adapted to return the process
+            if (await checkPort(DEBUG_PORT)) {
+                console.log('Warning: Chrome port seems busy. Attempting to kill orphan processes...');
+                try {
+                    // Simple kill attempt for Linux/CI
+                    require('child_process').execSync(`pkill -f "remote-debugging-port=${DEBUG_PORT}" || true`);
+                    await sleep(2000);
+                } catch (e) { }
+            }
+
+            console.log(`Launching Chrome (Isolated for ${user.username})...`);
+            const userDataDir = path.join(os.tmpdir(), `chrome_${Date.now()}_${i}`);
+            const args = [
+                `--remote-debugging-port=${DEBUG_PORT}`,
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--disable-gpu',
+                '--window-size=1280,720',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                `--user-data-dir=${userDataDir}`,
+                '--disable-dev-shm-usage'
+            ];
+
+            chromeProcess = spawn(CHROME_PATH, args, {
+                detached: true,
+                stdio: 'ignore'
+            });
+            chromeProcess.unref();
+
+            // Wait for Port
+            console.log('Waiting for Chrome...');
+            let portReady = false;
+            for (let k = 0; k < 20; k++) {
+                if (await checkPort(DEBUG_PORT)) {
+                    portReady = true;
+                    break;
+                }
+                await new Promise(r => setTimeout(r, 1000));
+            }
+            if (!portReady) throw new Error('Chrome launch timeout');
+
+            // Connect
+            console.log(`Connecting to Chrome...`);
+            browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
+            const defaultContext = browser.contexts()[0];
+            page = await defaultContext.newPage();
+
+            await page.addInitScript(INJECTED_SCRIPT);
+            page.setDefaultTimeout(60000);
+
+            let loginSuccess = false;
+
             // --- Part A: Login ---
             console.log('--- Phase 1: Browser Login ---');
             await page.goto('https://dash.hidencloud.com/auth/login');
@@ -505,66 +535,48 @@ async function handleVerification(page) {
                 }
             }
 
+            // --- Part B: Renewal Logic ---
             if (loginSuccess) {
-                // Get Cookies
-                const allCookies = await defaultContext.cookies();
-                const relevantCookies = allCookies.filter(c => c.domain.includes('hidencloud.com'));
-                cookieStr = relevantCookies.map(c => `${c.name}=${c.value}`).join('; ');
-
-                // Get Real User Agent
-                userAgent = await page.evaluate(() => navigator.userAgent);
-                console.log(`User-Agent: ${userAgent.substring(0, 50)}...`);
-
-                // Export Cookies (Debug/Optional)
-                const turnstileCookie = relevantCookies.find(c => c.name === 'hc_cf_turnstile');
-                if (turnstileCookie) {
-                    console.log(`✅ Cookie Extracted: hc_cf_turnstile=${turnstileCookie.value.substring(0, 10)}...`);
+                console.log('\n--- Phase 2: Renewal Operations (Browser Mode) ---');
+                if (page.isClosed()) {
+                    console.error('Error: Page was closed unexpectedly.');
+                } else {
+                    const bot = new HidenCloudBot(page, user.username);
+                    if (await bot.init()) {
+                        for (const svc of bot.services) {
+                            await bot.processService(svc);
+                        }
+                        summary.push({ user: user.username, status: 'Success', services: bot.services.length });
+                    } else {
+                        summary.push({ user: user.username, status: 'Failed (API Init)', services: 0 });
+                    }
                 }
+            } else {
+                summary.push({ user: user.username, status: 'Failed (Login)', services: 0 });
             }
 
         } catch (err) {
-            console.error(`Browser Interaction Error: ${err.message}`);
-            await page.screenshot({ path: `error_browser_${i}.png` });
-        }
+            console.error(`Error processing user ${user.username}: ${err.message}`);
+            if (page) await page.screenshot({ path: `error_process_${i}.png` }).catch(() => { });
+        } finally {
+            // Cleanup Everything for this user
+            console.log('Cleaning up user environment...');
+            try { if (browser) await browser.close(); } catch (e) { }
 
-        // Note: Do NOT close the page immediately here, we need it for Phase 2
-
-        // --- Part B: Renewal Logic ---
-        if (loginSuccess) {
-            console.log('\n--- Phase 2: Renewal Operations (Browser Mode) ---');
-            // Check if page is still open
-            if (page.isClosed()) {
-                console.error('Error: Page was closed unexpectedly.');
-            } else {
-                const bot = new HidenCloudBot(page, user.username);
-                if (await bot.init()) {
-                    for (const svc of bot.services) {
-                        await bot.processService(svc);
-                    }
-                    summary.push({ user: user.username, status: 'Success', services: bot.services.length });
+            // Kill the chrome process we started
+            try {
+                if (process.platform === 'win32') {
+                    require('child_process').execSync(`taskkill /F /IM chrome.exe /FI "WINDOWTITLE eq Chrome (Isolated*)" || taskkill /F /IM chrome.exe`); // Imprecise on Windows but best effort
                 } else {
-                    summary.push({ user: user.username, status: 'Failed (API Init)', services: 0 });
+                    if (chromeProcess && chromeProcess.pid) process.kill(-chromeProcess.pid, 'SIGKILL'); // If we could use pgid
+                    require('child_process').execSync(`pkill -f "remote-debugging-port=${DEBUG_PORT}" || true`);
                 }
-            }
-        } else {
-            summary.push({ user: user.username, status: 'Failed (Login)', services: 0 });
-        }
+            } catch (e) { }
 
-        // Cleanup Page
-        try { if (!page.isClosed()) await page.close(); } catch (e) { }
-
-        // Clear cookies for next user
-        if (i < users.length - 1) {
-            console.log('Clearing cookies for next user...');
-            await defaultContext.clearCookies();
-            await sleep(5000);
+            // Wait for port close
+            await sleep(2000);
         }
     }
-
-    console.log('Cleaning up browser...');
-    try { if (browser) await browser.close(); } catch (e) { }
-
-    console.log('Done (Forced Exit).');
 
     console.log('\n\n╔════════════════════════════════════════════╗');
     console.log('║               Final Summary                ║');
