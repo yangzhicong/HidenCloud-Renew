@@ -93,36 +93,12 @@ function getUsers() {
 // ==========================================
 
 class HidenCloudBot {
-    constructor(cookieStr, username, userAgent) {
+    constructor(page, username) {
+        this.page = page;
         this.username = username;
-        this.originalCookie = cookieStr;
-        this.cookieData = {};
-        this.parseCookieStr(cookieStr);
-
-        this.commonHeaders = {
-            'Host': 'dash.hidencloud.com',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'User-Agent': userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Referer': 'https://dash.hidencloud.com/',
-            'Accept-Language': 'en-US,en;q=0.9',
-        };
-
-        // If Linux UA, remove explicit sec-ch-ua to avoid mismatch or allow axios to manage?
-        // Actually, best to just keep it generic or sync it. 
-        // For now, let's trust the dynamic UA is key.
-
-        this.client = axios.create({
-            baseURL: 'https://dash.hidencloud.com',
-            maxRedirects: 0,
-            validateStatus: status => status >= 200 && status < 500,
-            timeout: 30000
-        });
-
         this.services = [];
-        this.csrfToken = '';
         this.logMsg = [];
+        this.csrfToken = '';
     }
 
     log(msg) {
@@ -130,75 +106,48 @@ class HidenCloudBot {
         this.logMsg.push(msg);
     }
 
-    parseCookieStr(str) {
-        // ... (unchanged)
-        if (!str) return;
-        str.split(';').forEach(pair => {
-            const idx = pair.indexOf('=');
-            if (idx > 0) {
-                const key = pair.substring(0, idx).trim();
-                const val = pair.substring(idx + 1).trim();
-                if (!['path', 'domain', 'expires', 'httponly', 'secure', 'samesite'].includes(key.toLowerCase())) {
-                    this.cookieData[key] = val;
-                }
-            }
-        });
-    }
-
-    updateCookiesFromResponse(headers) {
-        const setCookie = headers['set-cookie'];
-        if (setCookie) {
-            setCookie.forEach(sc => {
-                const firstPart = sc.split(';')[0];
-                const idx = firstPart.indexOf('=');
-                if (idx > 0) {
-                    const key = firstPart.substring(0, idx).trim();
-                    const val = firstPart.substring(idx + 1).trim();
-                    this.cookieData[key] = val;
-                }
-            });
-        }
-    }
-
-    getCookieStr() {
-        return Object.keys(this.cookieData).map(k => `${k}=${this.cookieData[k]}`).join('; ');
-    }
-
+    // Wrap fetch inside the browser context
     async request(method, url, data = null, extraHeaders = {}) {
-        let currentUrl = url;
-        const requestHeaders = {
-            ...this.commonHeaders,
-            ...extraHeaders,
-            'Cookie': this.getCookieStr()
-        };
+        // Construct full URL if needed
+        const targetUrl = url.startsWith('http') ? url : `https://dash.hidencloud.com${url.startsWith('/') ? '' : '/'}${url}`;
 
-        if (method === 'POST' && !requestHeaders['Content-Type']) {
-            requestHeaders['Content-Type'] = 'application/x-www-form-urlencoded';
+        // Prepare Headers - Browser handles User-Agent, Cookie, Host, etc.
+        // We only add specific functional headers
+        const headers = { ...extraHeaders };
+        if (method === 'POST' && !headers['Content-Type']) {
+            headers['Content-Type'] = 'application/x-www-form-urlencoded';
+        }
+        // CSRF Token if we have it
+        if (this.csrfToken && !headers['X-CSRF-TOKEN']) {
+            headers['X-CSRF-TOKEN'] = this.csrfToken;
         }
 
         try {
-            const res = await this.client({
-                method,
-                url: currentUrl,
-                headers: requestHeaders,
-                data
-            });
+            // Execute fetch inside the browser
+            const result = await this.page.evaluate(async ({ url, method, data, headers }) => {
+                const options = {
+                    method: method,
+                    headers: headers,
+                    redirect: 'follow' // Let browser verify redirects automatically
+                };
+                if (data) options.body = data;
 
-            this.updateCookiesFromResponse(res.headers);
-            res.finalUrl = currentUrl;
+                const res = await fetch(url, options);
+                const text = await res.text();
 
-            if (res.status === 301 || res.status === 302) {
-                const location = res.headers['location'];
-                if (location) {
-                    this.log(`🔄 重定向 -> ${location}`);
-                    currentUrl = location.startsWith('http') ? location : `https://dash.hidencloud.com${location.startsWith('/') ? '' : '/'}${location}`;
-                    return this.request('GET', currentUrl);
-                }
-            }
-            res.finalUrl = currentUrl;
-            return res;
+                return {
+                    status: res.status,
+                    url: res.url, // Final URL after redirects
+                    headers: {}, // We can't iterate headers easily in all browsers, but usually not needed for logic if we trust auto-redirects
+                    data: text
+                };
+            }, { url: targetUrl, method, data: data ? data.toString() : null, headers });
+
+            // Normalize result to match our previous axios structure
+            result.finalUrl = result.url;
+            return result;
         } catch (err) {
-            throw err;
+            throw new Error(`Browser Fetch Error: ${err.message}`);
         }
     }
 
@@ -208,11 +157,14 @@ class HidenCloudBot {
     }
 
     async init() {
-        this.log('🔍 正在验证 API 登录状态...');
+        this.log('🔍 正在验证 API 登录状态 (Browser Mode)...');
         try {
+            await sleep(2000); // Wait a bit
             const res = await this.request('GET', '/dashboard');
-            if (res.headers.location && res.headers.location.includes('/login')) {
-                this.log('❌ Cookie 无效，无法访问仪表盘');
+
+            // Check for login redirection
+            if (res.finalUrl.includes('/login') || res.finalUrl.includes('/auth')) {
+                this.log('❌ 浏览器似乎未保持登录状态');
                 return false;
             }
 
@@ -221,7 +173,7 @@ class HidenCloudBot {
             this.log(`Debug: Page Title = "${title}"`);
 
             if (title.includes('Just a moment') || title.includes('Attention Required')) {
-                this.log('⚠️ 检测到 Cloudflare 拦截页面 (Axios UA/TLS 指纹不符)');
+                this.log('⚠️ 依然检测到拦截页面，请检查 Turnstile');
                 return false;
             }
 
@@ -262,10 +214,7 @@ class HidenCloudBot {
             params.append('_token', formToken);
             params.append('days', RENEW_DAYS);
 
-            const res = await this.request('POST', `/service/${service.id}/renew`, params, {
-                'X-CSRF-TOKEN': this.csrfToken,
-                'Referer': `https://dash.hidencloud.com/service/${service.id}/manage`
-            });
+            const res = await this.request('POST', `/service/${service.id}/renew`, params.toString());
 
             if (res.finalUrl && res.finalUrl.includes('/invoice/')) {
                 this.log(`⚡️ 续期成功，前往支付`);
@@ -348,15 +297,14 @@ class HidenCloudBot {
         this.log(`💳 提交支付...`);
 
         try {
-            const payRes = await this.request('POST', targetAction, payParams, {
-                'X-CSRF-TOKEN': this.csrfToken,
-                'Referer': currentUrl
-            });
+            // No Referer needed for Browser Fetch (it handles it, or we rely on standard behavior)
+            // But we can add it if needed
+            const res = await this.request('POST', targetAction, payParams.toString());
 
-            if (payRes.status === 200) {
+            if (res.status === 200) {
                 this.log(`✅ 支付成功！`);
             } else {
-                this.log(`⚠️ 支付响应: ${payRes.status}`);
+                this.log(`⚠️ 支付响应: ${res.status}`);
             }
         } catch (e) {
             this.log(`❌ 支付失败: ${e.message}`);
@@ -577,25 +525,33 @@ async function handleVerification(page) {
         } catch (err) {
             console.error(`Browser Interaction Error: ${err.message}`);
             await page.screenshot({ path: `error_browser_${i}.png` });
-        } finally {
-            await page.close();
         }
 
+        // Note: Do NOT close the page immediately here, we need it for Phase 2
+
         // --- Part B: Renewal Logic ---
-        if (loginSuccess && cookieStr) {
-            console.log('\n--- Phase 2: Renewal Operations ---');
-            const bot = new HidenCloudBot(cookieStr, user.username, userAgent);
-            if (await bot.init()) {
-                for (const svc of bot.services) {
-                    await bot.processService(svc);
-                }
-                summary.push({ user: user.username, status: 'Success', services: bot.services.length });
+        if (loginSuccess) {
+            console.log('\n--- Phase 2: Renewal Operations (Browser Mode) ---');
+            // Check if page is still open
+            if (page.isClosed()) {
+                console.error('Error: Page was closed unexpectedly.');
             } else {
-                summary.push({ user: user.username, status: 'Failed (API Init)', services: 0 });
+                const bot = new HidenCloudBot(page, user.username);
+                if (await bot.init()) {
+                    for (const svc of bot.services) {
+                        await bot.processService(svc);
+                    }
+                    summary.push({ user: user.username, status: 'Success', services: bot.services.length });
+                } else {
+                    summary.push({ user: user.username, status: 'Failed (API Init)', services: 0 });
+                }
             }
         } else {
             summary.push({ user: user.username, status: 'Failed (Login)', services: 0 });
         }
+
+        // Cleanup Page
+        try { if (!page.isClosed()) await page.close(); } catch (e) { }
 
         // Clear cookies for next user
         if (i < users.length - 1) {
